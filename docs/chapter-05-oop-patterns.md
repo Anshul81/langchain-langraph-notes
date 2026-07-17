@@ -1,6 +1,6 @@
 # Chapter 0.6: OOP Patterns for AI Applications
 
-> **Phase 0 — Python Power-Up** | [← Previous: Async Python](chapter-04-async-python.md) | [Next: Phase 1 — What is an LLM? →](../phase-01-llm-fundamentals/chapter-06-what-is-an-llm.md)
+> **Phase 0 — Python Power-Up** | [← Previous: Async Python](chapter-04-async-python.md) | [Next: Phase 1 — What is an LLM? →](chapter-06-what-is-an-llm.md)
 
 ---
 
