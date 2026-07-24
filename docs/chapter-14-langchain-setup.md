@@ -1,6 +1,6 @@
 # Chapter 3.1: LangChain Installation & Hello World
 
-> **Phase 3 — LangChain Core** | [← Previous: Output Parsing](../phase-02-prompt-engineering/chapter-13-output-parsing.md) | [Next: Runnable Protocol & LCEL →](chapter-15-runnable-lcel.md)
+> **Phase 3 — LangChain Core** | [← Previous: Output Parsing](chapter-13-output-parsing.md) | [Next: Runnable Protocol & LCEL →](chapter-15-runnable-lcel.md)
 
 ---
 
