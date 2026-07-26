@@ -226,4 +226,4 @@ response = llm.invoke("Hello")
 
 In the next chapter, you'll learn the **Runnable Protocol & LCEL (LangChain Expression Language)** — LangChain's pipe operator (`|`) that lets you chain components together like Unix commands. This is the core abstraction that makes LangChain powerful.
 
-> [← Previous: Output Parsing](../phase-02-prompt-engineering/chapter-13-output-parsing.md) | [Next: Runnable Protocol & LCEL →](chapter-15-runnable-lcel.md)
+> [← Previous: Output Parsing](chapter-13-output-parsing.md) | [Next: Runnable Protocol & LCEL →](chapter-15-runnable-lcel.md)
