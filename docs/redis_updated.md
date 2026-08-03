@@ -483,3 +483,243 @@ This is exactly why the key ends with `_{project_id}` — the wildcard `*_{proje
 
 **One-line summary for the interview:**
 > "At ingestion we copy each project's prompts from a master Postgres catalog into a per-project table and warm a Redis hash cache keyed `type_attribute_projectId`. Every analysis service then reads prompts cache-aside — Redis first, Postgres as fallback — turning millions of prompt lookups per run into sub-millisecond in-memory reads, while staying fully functional even if Redis is down."
+
+---
+
+## Part 7 — Full sample flow (using this codebase)
+
+> Narrate this exact example in an interview. It walks one prompt from ingestion → Redis → snippet analysis → LLM → saved result.
+
+### Scenario
+
+- Project id: **869**
+- Tech: **cobol** (same idea for java/cpp/etc.)
+- Goal: generate a **short summary** for one code snippet node
+
+### Important clarification
+
+`get_prompt` does **not** return the AI answer.  
+It returns a **prompt template**. That template is filled with real code/context and then sent to the LLM.
+
+Chain:
+
+**Redis → `get_prompt` → template string → fill placeholders → LLM call → AI summary**
+
+---
+
+### Phase 1 — Warm the cache (happens once at ingestion)
+
+#### Step 1: Repo analyser starts
+
+When a repo is ingested, `repo_analyser_service` loads prompts first:
+
+```python
+# repo_analyser_service.py
+di[PromptCatalogService].load_prompt_catalog_for_project(project.id, project_data.technology)
+self.discover_files(...)
+```
+
+#### Step 2: Copy master prompts → per-project table
+
+```python
+# prompt_catalog_service.py
+def load_prompt_catalog_for_project(self, project_id, tech):
+    project_prompts = self.add_prompt_catalog_of_project_into_db(project_id, tech)  # master → per-project
+    di[RedisService].add_prompts_of_project(project_id, project_prompts)            # warm Redis
+```
+
+What happens:
+1. Read from master table `prompt_catalog` (provider + tech = cobol/all)
+2. Insert into `project_prompt_catalog` for project `869`
+3. One of those rows is roughly:
+
+| id | project_id | type | attribute | text |
+|----|------------|------|-----------|------|
+| 42 | 869 | snippet | short_summary | `Write a concise short summary of: {business_summary}` |
+
+#### Step 3: Write into Redis
+
+```python
+# redis_service.py (repository_analyser_service)
+pipeline.hset(hash_name.lower(), mapping=hash_mapping)
+pipeline.expire(hash_name, PROMPT_CACHE_TTL_IN_SEC)  # 172800s = 48h
+pipeline.execute()
+```
+
+For our sample prompt, Redis now has:
+
+```text
+Key:   snippet_short_summary_869
+Type:  Hash
+Fields:
+  prompt_id = "42"
+  text      = "Write a concise short summary of: {business_summary}"
+TTL:   172800 seconds (48 hours)
+```
+
+At this point ingestion continues (clone/discover files). Prompt cache is ready for later services.
+
+---
+
+### Phase 2 — Use the cached prompt (snippet analyser)
+
+Later, `snippet-analyser-service` processes snippet nodes for this project.
+
+#### Step 4: Orchestrator starts summarizing snippets
+
+```python
+# snippet_summariser.py
+def orchestrate_summarization(self, summary_metadata):
+    self.project_id = project_id
+    self.tech = tech
+    for snippet in self.__get_snippet_nodes(run_file_id, analysis_mode):
+        ...
+```
+
+For each snippet node it generates fields like business summary, then short summary.
+
+#### Step 5: Ask for short summary
+
+```python
+# snippet_summariser.py
+snippet.short_summary_prompt_id, snippet.short_summary = self.__generate_short_summary(
+    business_summary=snippet.business_summary
+)
+```
+
+Example input data:
+
+```text
+business_summary = "This paragraph validates customer account balance before posting a debit."
+```
+
+#### Step 6: Fetch template (Redis first)
+
+```python
+# snippet_summariser.py
+def __generate_short_summary(self, **kwargs):
+    prompt_id, template = self.get_prompt_template(attribute="short_summary")
+    return prompt_id, self.generate_summarization(template=template, ...)
+```
+
+`get_prompt_template` calls Redis-backed `PromptService.get_prompt`:
+
+```python
+# summariser.py (base class)
+return di[PromptService].get_prompt(
+    project_id=project_id,
+    provider=model_provider,
+    tech=tech,
+    type=type,
+    attribute=attribute,
+)
+```
+
+Inside `PromptService`:
+
+```text
+1) Build key: "snippet_short_summary_869"
+2) Redis HGETALL
+3) HIT → return (42, "Write a concise short summary of: {business_summary}")
+```
+
+If Redis missed/failed, it would query Postgres `project_prompt_catalog` instead.
+
+#### Step 7: Fill template + call LLM
+
+```python
+# summariser.py
+def generate_summarization(...):
+    prompt = template.format(**kwargs)   # fill {business_summary}
+    summary = generate_completion_with_proxy(prompt, ...)
+    return summary
+```
+
+Concrete fill:
+
+```text
+Template from Redis:
+  "Write a concise short summary of: {business_summary}"
+
+After .format(business_summary=...):
+  "Write a concise short summary of: This paragraph validates customer account balance before posting a debit."
+
+LLM response example:
+  "Validates account balance before debit posting."
+```
+
+#### Step 8: Save result on the snippet node
+
+```text
+snippet.short_summary_prompt_id = 42
+snippet.short_summary = "Validates account balance before debit posting."
+```
+
+That result is persisted on the node. Redis is **not** storing this answer — only the prompt template.
+
+---
+
+### Full flow diagram (this exact sample)
+
+```text
+[User starts project ingestion]
+            |
+            v
+repo_analyser_service
+  load_prompt_catalog_for_project(869, "cobol")
+            |
+            +--> Postgres prompt_catalog (master)
+            |         |
+            |         v
+            +--> Postgres project_prompt_catalog (project 869 copy)
+            |         |
+            |         v
+            +--> Redis HSET
+                   key = snippet_short_summary_869
+                   fields = {prompt_id:42, text:"...{business_summary}"}
+                   expire = 48h
+            |
+            v
+[Later] snippet-analyser processes a Snippet node
+            |
+            v
+orchestrate_summarization(...)
+  __generate_short_summary(business_summary="...")
+            |
+            v
+get_prompt_template(attribute="short_summary")
+            |
+            v
+PromptService.get_prompt(...)
+  Redis HGETALL("snippet_short_summary_869")  --> CACHE HIT
+            |
+            v
+generate_summarization(template, business_summary=...)
+  template.format(...)
+  generate_completion_with_proxy(...)  --> LLM
+            |
+            v
+snippet.short_summary = "Validates account balance before debit posting."
+```
+
+---
+
+### Same pattern is reused elsewhere
+
+Once you understand this sample, the other call sites are the same idea:
+
+| Where | What prompt is used for |
+|-------|-------------------------|
+| `snippet-analyser` summarisers | business summary, short summary, topic, tags |
+| `snippet-analyser` / `parser` extractors | entity extraction, XML repair prompts |
+| `parent-analyser` | parent-level summaries |
+| `insights-generator` | flow/module summaries, functional-group business summary |
+| `mirrormotive` API | algo/data-flow/risk views, agent prompts |
+
+Always: **fetch template from Redis → fill → send to LLM**.
+
+---
+
+### 30-second interview answer for this sample
+
+> “When a project is ingested, repo-analyser copies prompt templates into a per-project Postgres table and warms Redis hashes keyed like `snippet_short_summary_869`. Later, snippet-analyser needs a short summary for each code node. It calls `get_prompt`, which reads that Redis hash, fills placeholders like `{business_summary}` with real node data, and sends the filled prompt to the LLM. Redis stores the template, not the AI output. If Redis is down, we fall back to Postgres.”
