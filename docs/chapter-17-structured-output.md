@@ -1,6 +1,6 @@
 # Chapter 3.4: Structured Output with `with_structured_output()`
 
-> **Phase 3 — LangChain Core** | [← Previous: ChatPromptTemplate](chapter-16-chat-prompt-template.md) | [Next: Phase 4 — Chains & Runnables →](../phase-04-chains-runnables/chapter-18-runnables-deep-dive.md)
+> **Phase 3 — LangChain Core** | [← Previous: ChatPromptTemplate](chapter-16-chat-prompt-template.md) | [Next: Phase 4 — Chains & Runnables →](chapter-18-runnables-deep-dive.md)
 
 ---
 
