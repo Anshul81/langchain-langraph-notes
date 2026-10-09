@@ -8,81 +8,91 @@
 
 By the end of this chapter, you will:
 
-- ✅ Assemble a **multi-agent research pipeline** end-to-end
-- ✅ Combine **planning**, **parallel retrieval**, **specialist writers**, and **reflection**
-- ✅ Use **checkpointing** for long research sessions
-- ✅ Stream progress to the console
-- ✅ Document architecture decisions for interviews and capstone reuse
+- ✅ Assemble a **complete multi-agent research system** in ~200 lines of LangGraph
+- ✅ Combine **planner → parallel tool-using specialists → writer → critic loop**
+- ✅ Give specialists **real `@tool`s** (Wikipedia when available, a keyword-searched local knowledge base, a calculator)
+- ✅ Separate **shared state** from **private agent state**
+- ✅ Add **checkpointing (`MemorySaver`)** and **streamed progress**
+- ✅ Handle the two classic failures: **bad plans** and **empty tool results**
 
 | | |
 |---|---|
-| **Prerequisites** | Phase 13–16 |
-| **Estimated Reading Time** | 35 minutes |
-| **Estimated Coding Time** | 90 minutes |
+| **Prerequisites** | Chapters 16.1–16.5, Phase 14 (`Send`, parallel branches) |
+| **Estimated Reading Time** | 25 minutes |
+| **Estimated Coding Time** | 75 minutes |
 
 ---
 
 ## Introduction — The Problem
 
-Single-shot RAG answers complex research poorly:
+One agent asked a broad research question produces a long, vague, partly invented answer:
 
 ```
-"Compare LangGraph checkpoint backends for enterprise"
-→ one retrieval pass, no plan, no critique, shallow answer
+"Compare solar PV and onshore wind: how does each work, and which produces
+ more energy per year from 100 MW of installed capacity?"
+
+Single agent → mixes facts and math, guesses capacity factors, no one checks the sum.
 ```
 
-**Project goal:** build a **Research Team Graph** that plans sub-questions, gathers evidence in parallel, drafts, and reflects before delivery.
+### The Solution — A Small Research Team
 
 ```
-User query
-    │
-    ▼
- Planner ──► Research team (parallel sources)
-    │              │
-    ▼              ▼
- Writer ◄── evidence bundle
-    │
-    ▼
- Critic ──► (revise loop) ──► Final report
+                         ┌──────────────┐
+  question ─────────────▶│   PLANNER    │  2–3 sub-questions, each tagged with a specialist
+                         └──────┬───────┘
+                   Send × N (parallel)
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+      ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+      │ FACTS agent  │  │NUMBERS agent │  │ FACTS agent  │   each = create_react_agent
+      │ wiki_search  │  │ kb_search    │  │ ...          │   with REAL tools; its tool
+      │ kb_search    │  │ calculator   │  │              │   chatter stays PRIVATE
+      └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+             └─────────────────┼─────────────────┘
+                               ▼   findings (shared, append-only)
+                         ┌──────────────┐
+                         │    WRITER    │◀──────────────┐
+                         └──────┬───────┘               │ revise
+                                ▼                       │ (max 2)
+                         ┌──────────────┐  score < 8    │
+                         │    CRITIC    │───────────────┘
+                         └──────┬───────┘
+                                ▼ approved or out of revisions
+                               END          (MemorySaver checkpoints every step)
 ```
 
-### The Solution — Composed LangGraph
-
-One `StateGraph` with reducers, conditional loops, and optional `MemorySaver`.
+| Node | Type | Tools |
+|------|------|-------|
+| `planner` | LLM, structured output | — |
+| `specialist` ×N (parallel) | **Tool agents** (`create_react_agent`) | `wiki_search`, `kb_search`, `calculator` |
+| `writer` | LLM synthesis from evidence only | — (deliberately: it may only use findings) |
+| `critic` | LLM, structured output | — |
 
 ---
 
-## Part 1: Architecture Overview
+## Part 1: Real Tools
 
-| Node | Role |
-|------|------|
-| `planner` | Decompose query into sub-questions |
-| `search_a` / `search_b` / `search_c` | Parallel mock retrievers |
-| `merge_evidence` | Normalize snippets |
-| `writer` | Draft report |
-| `critic` | Score completeness |
-| `revise` | Improve draft using critique |
-
-State keys:
-
-```
-objective, subquestions[], snippets[], draft, score, attempts, messages[]
-```
-
----
-
-## Part 2: Full Implementation
+Three tools. Nothing here returns a canned string pretending to be a search: `kb_search` actually tokenizes and scores a knowledge base, `wiki_search` actually calls Wikipedia when enabled, and `calculator` actually evaluates expressions.
 
 ```python
+import ast
+import json
+import operator as op
 import os
+import re
+import sys
 from operator import add
-from typing import TypedDict, Annotated, Literal
+from typing import Annotated, Literal, TypedDict
+
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Send
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -90,299 +100,462 @@ llm = ChatOpenAI(
     model=os.getenv("LITE_LLM_MODEL", "gpt-4o-mini"),
     api_key=os.getenv("LITELLM_PROXY_API_KEY"),
     base_url=os.getenv("LITELLM_PROXY_API_BASE"),
+    temperature=0,
 )
+
+# ── Curated local knowledge base (approximate figures, for teaching) ──
+KB = [
+    {"title": "Solar photovoltaic power",
+     "text": "Solar PV panels convert sunlight directly into electricity using semiconductor cells "
+             "(the photovoltaic effect). They only produce in daylight. Typical utility-scale "
+             "solar capacity factor: about 25%."},
+    {"title": "Onshore wind power",
+     "text": "Wind turbines use rotor blades to turn the kinetic energy of wind into electricity "
+             "through a generator. Output varies with wind speed. Typical onshore wind capacity "
+             "factor: about 35% (offshore about 45%)."},
+    {"title": "Capacity factor",
+     "text": "Capacity factor is actual energy produced divided by the maximum possible if the plant "
+             "ran at full capacity all year. A year has 8,760 hours, so annual energy (MWh) = "
+             "capacity (MW) x capacity factor x 8,760."},
+    {"title": "Intermittency and storage",
+     "text": "Solar and wind are intermittent. Grids balance them with batteries, pumped hydro, "
+             "demand response and wider transmission."},
+    {"title": "Nuclear power",
+     "text": "Nuclear plants split uranium atoms to make steam. They run at roughly 90% capacity factor."},
+]
+STOP = {"the", "and", "how", "does", "what", "for", "from", "with", "per", "are", "which", "each", "using"}
+
+
+def _tokens(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 2 and t not in STOP}
+
+
+def _kb_lookup(query: str, top_k: int = 2) -> str:
+    q = _tokens(query)
+    scored = sorted(((len(q & _tokens(e["title"] + " " + e["text"])), e) for e in KB),
+                    key=lambda x: x[0], reverse=True)
+    hits = [f"[{e['title']}] {e['text']}" for score, e in scored[:top_k] if score > 0]
+    return "\n".join(hits) if hits else f"NO_RESULT: knowledge base has nothing for '{query}'"
+
+
+@tool
+def kb_search(query: str) -> str:
+    """Search the curated local knowledge base (solar, wind, capacity factor, storage, nuclear).
+    Use short keyword queries like 'solar capacity factor'."""
+    return _kb_lookup(query)
+
+
+@tool
+def wiki_search(query: str) -> str:
+    """Search Wikipedia for a short summary of a concept. Falls back to the local knowledge
+    base when Wikipedia is disabled or unreachable."""
+    if os.getenv("USE_WIKIPEDIA", "0") == "1":
+        try:
+            import wikipedia  # pip install wikipedia
+            return "[wikipedia] " + wikipedia.summary(query, sentences=3, auto_suggest=False)
+        except Exception as exc:        # ImportError, network, disambiguation, page missing
+            return f"[wikipedia failed: {type(exc).__name__}; using local KB]\n" + _kb_lookup(query)
+    return "[local KB]\n" + _kb_lookup(query)
+
+
+_OPS = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.USub: op.neg}
+
+
+def _eval(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_eval(node.left), _eval(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_eval(node.operand))
+    raise ValueError("unsupported expression")
+
+
+@tool
+def calculator(expression: str) -> str:
+    """Evaluate arithmetic such as '100 * 0.25 * 8760'. Supports + - * / and parentheses."""
+    try:
+        return str(round(_eval(ast.parse(expression, mode="eval").body), 4))
+    except Exception as exc:
+        return f"ERROR: {exc}"
+```
+
+Quick offline check — tools work without any LLM:
+
+```python
+print(kb_search.invoke({"query": "solar capacity factor"}))   # real scored lookup
+print(calculator.invoke({"expression": "100 * 0.25 * 8760"}))  # 219000.0
+print(kb_search.invoke({"query": "quantum gravity"}))          # NO_RESULT: ...
+```
+
+---
+
+## Part 2: Specialist Agents
+
+Each specialist is a ReAct agent with **only the tools it needs** (less confusion, less risk).
+
+```python
+SPECIALISTS = {
+    "facts": create_react_agent(llm, [wiki_search, kb_search], prompt=(
+        "You are the FACTS specialist. Call wiki_search or kb_search before answering; never rely on "
+        "memory. Answer in at most 3 sentences and name the tool you used. If every tool returns "
+        "NO_RESULT, reply exactly: NO EVIDENCE FOUND")),
+    "numbers": create_react_agent(llm, [kb_search, calculator], prompt=(
+        "You are the NUMBERS specialist. Get input figures with kb_search (e.g. capacity factors), then "
+        "compute EVERY result with calculator. Show the expressions and final numbers. If the needed "
+        "figures are missing, reply exactly: NO EVIDENCE FOUND")),
+}
+```
+
+---
+
+## Part 3: State (Shared vs Private) and Planner
+
+```python
+MAX_SUBQUESTIONS = 3
+MAX_REVISES = 2
+APPROVE_SCORE = 8
 
 
 class ResearchState(TypedDict):
-    objective: str
-    subquestions: list[str]
-    snippets: Annotated[list[str], add]
-    draft: str
+    # ── SHARED: every node can read these ──
+    question: str
+    subquestions: list[dict]
+    findings: Annotated[list[dict], add]      # parallel specialists append here
+    report: str
     critique: str
-    score: float
-    attempts: int
-    messages: Annotated[list, add_messages]
+    score: int
+    revisions: int
+
+
+class SubQuestion(BaseModel):
+    question: str = Field(description="A self-contained sub-question")
+    specialist: Literal["facts", "numbers"] = Field(
+        description="facts = how/what/why background; numbers = needs figures + calculation")
+
+
+class ResearchPlan(BaseModel):
+    subquestions: list[SubQuestion] = Field(description="2-3 sub-questions")
+
+
+planner_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
 
 
 def planner(state: ResearchState) -> dict:
-    prompt = [
-        SystemMessage(content=(
-            "Split the research objective into exactly 3 sub-questions. "
-            "One per line, no numbering."
-        )),
-        HumanMessage(content=state["objective"]),
-    ]
-    raw = llm.invoke(prompt).content
-    subs = [ln.strip() for ln in raw.splitlines() if ln.strip()][:3]
-    return {
-        "subquestions": subs,
-        "messages": [AIMessage(content=f"Plan: {subs}")],
-        "attempts": 0,
-    }
+    plan = planner_llm.invoke([
+        SystemMessage(content="Decompose the research question into 2-3 non-overlapping sub-questions. "
+                             "Assign each to 'facts' (concepts) or 'numbers' (figures + calculation)."),
+        HumanMessage(content=state["question"]),
+    ])
+    subs = [s.model_dump() for s in plan.subquestions[:MAX_SUBQUESTIONS]]
+    if not subs:                                   # failure mode: empty/bad plan → safe fallback
+        subs = [{"question": state["question"], "specialist": "facts"}]
+    return {"subquestions": subs}
+```
+
+### Shared vs private state in this project
+
+| State | Scope | Lives in | Why |
+|-------|-------|----------|-----|
+| `question`, `subquestions` | **Shared** | `ResearchState` | Everyone needs the goal |
+| `findings` | **Shared** (append-only reducer) | `ResearchState` | The *only* output of specialists |
+| `report`, `critique`, `score`, `revisions` | **Shared** | `ResearchState` | Writer/critic loop |
+| Specialist's tool calls, raw tool outputs, ReAct messages | **Private** | Inside `agent.invoke(...)` — discarded after the node | Keeps the shared state small; writer sees distilled answers |
+| `sub` + `idx` | **Private input** | `Send` payload to one specialist run | Each parallel worker sees only its own question |
+
+Principle from Chapter 16.4: **share conclusions, keep working notes private.**
+
+---
+
+## Part 4: Parallel Specialists
+
+```python
+class SpecialistInput(TypedDict):
+    sub: dict
+    idx: int
 
 
-def _search(label: str, subquestions: list[str]) -> str:
-    q = subquestions[0] if subquestions else "general"
-    return f"[{label}] Evidence about '{q}' — mock paragraph with citations {label}-1."
+def fan_out(state: ResearchState) -> list[Send]:
+    return [Send("specialist", {"sub": s, "idx": i}) for i, s in enumerate(state["subquestions"])]
 
 
-def search_docs(state: ResearchState) -> dict:
-    return {"snippets": [_search("docs", state.get("subquestions", []))]}
+def specialist(state: SpecialistInput) -> dict:
+    sub = state["sub"]
+    try:
+        result = SPECIALISTS[sub["specialist"]].invoke(
+            {"messages": [("user", sub["question"])]}, {"recursion_limit": 12})
+        msgs = result["messages"]
+        answer = msgs[-1].content
+        evidence = [m for m in msgs if isinstance(m, ToolMessage)]        # private tool outputs
+        tools_used = [m.name for m in evidence]
+        # empty if: no tool was called (ungrounded), all tools found nothing, or agent gave up
+        empty = (not evidence) or all("NO_RESULT" in m.content for m in evidence) \
+            or "NO EVIDENCE FOUND" in answer
+    except Exception as exc:                                              # one bad worker ≠ crashed run
+        answer, tools_used, empty = f"AGENT ERROR: {type(exc).__name__}", [], True
+    return {"findings": [{"id": state["idx"] + 1, "question": sub["question"],
+                          "specialist": sub["specialist"], "answer": answer,
+                          "tools_used": tools_used, "empty": empty}]}
+```
 
+Parallel results arrive in any order, so each finding carries an `id`; the writer sorts by it.
 
-def search_web(state: ResearchState) -> dict:
-    return {"snippets": [_search("web", state.get("subquestions", []))]}
+---
 
+## Part 5: Writer and Critic
 
-def search_papers(state: ResearchState) -> dict:
-    return {"snippets": [_search("papers", state.get("subquestions", []))]}
-
-
-def merge_evidence(state: ResearchState) -> dict:
-    joined = "\n".join(state.get("snippets", []))
-    return {"messages": [AIMessage(content=f"Merged {len(state.get('snippets', []))} snippets.")]}
+```python
+def format_evidence(state: ResearchState) -> str:
+    rows = []
+    for f in sorted(state["findings"], key=lambda f: f["id"]):
+        status = "NO EVIDENCE" if f["empty"] else "ok"
+        rows.append(f"[{f['id']}] Q: {f['question']}\n    A: {f['answer']}\n"
+                    f"    (specialist={f['specialist']}, tools={f['tools_used'] or 'none'}, {status})")
+    return "\n".join(rows)
 
 
 def writer(state: ResearchState) -> dict:
-    critique = state.get("critique", "")
-    prompt = [
-        SystemMessage(content="Write a structured research brief with headings."),
-        HumanMessage(content=(
-            f"Objective: {state['objective']}\n"
-            f"Subquestions: {state.get('subquestions')}\n"
-            f"Evidence:\n" + "\n".join(state.get("snippets", [])) + "\n"
-            f"Critique to address: {critique}"
-        )),
-    ]
-    draft = llm.invoke(prompt).content
-    return {
-        "draft": draft,
-        "attempts": state.get("attempts", 0) + 1,
-        "messages": [AIMessage(content="Draft updated.")],
-    }
+    revising = bool(state.get("critique"))
+    human = f"Question: {state['question']}\n\nEvidence:\n{format_evidence(state)}"
+    if revising:
+        human += (f"\n\nPrevious report:\n{state['report']}\n\nCritic issues:\n{state['critique']}\n"
+                  "Rewrite the report and fix every issue.")
+    report = llm.invoke([
+        SystemMessage(content="Write a research brief (max 200 words) using ONLY the evidence. Cite "
+                             "sources as [1], [2]. For any NO EVIDENCE item write 'Not found: <question>' "
+                             "— never guess. End with a one-sentence conclusion."),
+        HumanMessage(content=human),
+    ]).content
+    return {"report": report, "revisions": state["revisions"] + (1 if revising else 0)}
+
+
+class Critique(BaseModel):
+    score: int = Field(ge=1, le=10, description="1-10 quality score")
+    issues: list[str] = Field(description="Concrete problems to fix; empty if none")
+
+
+critic_llm = llm.with_structured_output(Critique, method="function_calling")
 
 
 def critic(state: ResearchState) -> dict:
-    prompt = [
-        SystemMessage(content="Score 0-1 completeness. Format: SCORE|critique"),
-        HumanMessage(content=state.get("draft", "")),
-    ]
-    raw = llm.invoke(prompt).content
-    try:
-        score_str, crit = raw.split("|", 1)
-        score = float(score_str.replace("SCORE", "").strip())
-    except ValueError:
-        score, crit = 0.6, raw
-    return {"score": max(0.0, min(1.0, score)), "critique": crit.strip()}
+    c = critic_llm.invoke([
+        SystemMessage(content="Strict reviewer. Check: (1) every claim traces to the evidence, (2) no "
+                             "invented numbers, (3) NO EVIDENCE items are acknowledged, (4) the report "
+                             "answers the question. Score 1-10."),
+        HumanMessage(content=f"Question: {state['question']}\n\nEvidence:\n{format_evidence(state)}"
+                             f"\n\nReport:\n{state['report']}"),
+    ])
+    # never leave critique empty when failing, or the writer would not count a revision
+    return {"score": c.score, "critique": "; ".join(c.issues) or "Tighten wording and citations."}
 
 
-def route_quality(state: ResearchState) -> Literal["revise", END]:
-    if state.get("score", 0) >= 0.85:
+def after_critic(state: ResearchState) -> str:
+    if state["score"] >= APPROVE_SCORE or state["revisions"] >= MAX_REVISES:
         return END
-    if state.get("attempts", 0) >= 3:
-        return END
-    return "revise"
-
-
-def revise(state: ResearchState) -> dict:
-    return {"messages": [AIMessage(content=f"Revise pass {state.get('attempts')}")]}
-
-
-graph = StateGraph(ResearchState)
-graph.add_node("planner", planner)
-graph.add_node("search_docs", search_docs)
-graph.add_node("search_web", search_web)
-graph.add_node("search_papers", search_papers)
-graph.add_node("merge_evidence", merge_evidence)
-graph.add_node("writer", writer)
-graph.add_node("critic", critic)
-graph.add_node("revise", revise)
-
-graph.add_edge(START, "planner")
-for s in ("search_docs", "search_web", "search_papers"):
-    graph.add_edge("planner", s)
-    graph.add_edge(s, "merge_evidence")
-graph.add_edge("merge_evidence", "writer")
-graph.add_edge("writer", "critic")
-graph.add_conditional_edges("critic", route_quality, {"revise": "revise", END: END})
-graph.add_edge("revise", "writer")
-
-memory = MemorySaver()
-research_app = graph.compile(checkpointer=memory)
+    return "writer"
 ```
+
+The writer **cannot call tools** — it can only use evidence the specialists gathered. That is what makes "no invented numbers" enforceable by the critic.
 
 ---
 
-## Part 3: Run & Stream
+## Part 6: Assemble, Stream, Checkpoint
 
 ```python
+PAUSE = os.getenv("PAUSE", "0") == "1"      # optional: stop before writer to inspect findings
+
+g = StateGraph(ResearchState)
+g.add_node("planner", planner)
+g.add_node("specialist", specialist)
+g.add_node("writer", writer)
+g.add_node("critic", critic)
+g.add_edge(START, "planner")
+g.add_conditional_edges("planner", fan_out, ["specialist"])
+g.add_edge("specialist", "writer")           # waits for ALL parallel specialists
+g.add_edge("writer", "critic")
+g.add_conditional_edges("critic", after_critic, ["writer", END])
+app = g.compile(checkpointer=MemorySaver(), interrupt_before=["writer"] if PAUSE else [])
+
+
+def run(question: str, thread_id: str = "research-1") -> dict:
+    config = {"configurable": {"thread_id": thread_id}}
+    inputs = {"question": question, "subquestions": [], "findings": [], "report": "",
+              "critique": "", "score": 0, "revisions": 0}
+    while True:
+        for update in app.stream(inputs, config, stream_mode="updates"):
+            for node, out in update.items():
+                if node.startswith("__"):
+                    continue
+                if node == "planner":
+                    print(f">> planner     -> {[(s['specialist'], s['question'][:45]) for s in out['subquestions']]}")
+                elif node == "specialist":
+                    f = out["findings"][0]
+                    print(f">> specialist  -> #{f['id']} {f['specialist']} tools={f['tools_used']} empty={f['empty']}")
+                elif node == "writer":
+                    print(f">> writer      -> revision #{out['revisions']}")
+                elif node == "critic":
+                    print(f">> critic      -> score={out['score']}")
+        if not app.get_state(config).next:          # nothing left to run -> finished
+            break
+        print("|| paused before writer (state saved) - resuming from checkpoint...")
+        inputs = None                               # None = continue from saved checkpoint
+    return app.get_state(config).values
+
+
 if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "research-project-1"}}
-    objective = "Compare SQLite vs PostgreSQL LangGraph checkpointers for SaaS."
-
-    print("=== stream updates ===")
-    for chunk in research_app.stream(
-        {"objective": objective},
-        config=config,
-        stream_mode="updates",
-    ):
-        for node, update in chunk.items():
-            print(f"  [{node}] keys={list(update.keys())}")
-
-    final = research_app.invoke({"objective": objective}, config=config)
-    print("\n=== REPORT ===\n")
-    print(final.get("draft", "")[:2000])
-    print("\nScore:", final.get("score"), "Attempts:", final.get("attempts"))
+    sys.stdout.reconfigure(encoding="utf-8")        # Windows consoles: model text may contain ≈, —, etc.
+    final = run("Compare solar PV and onshore wind: how does each generate electricity, and which "
+                "produces more energy per year from 100 MW of installed capacity?")
+    print("\n=== REPORT ===\n" + final["report"])
+    print(f"\nscore={final['score']}  revisions={final['revisions']}")
 ```
 
 ---
 
-## Part 4: Extending the Project
+## How to Run
 
-```
-PRODUCTION UPGRADES:
-├── Replace mock search with real retrievers (Phase 11–12)
-├── Supervisor assigns subquestions to worker subgraphs
-├── interrupt_before writer for legal review
-├── PostgresSaver + thread per user
-├── LangSmith traces per node
-└── Export PDF via tool node
-```
+```bash
+pip install langchain-openai langgraph python-dotenv pydantic
+# optional real Wikipedia:   pip install wikipedia
 
----
-
-## Part 5: Testing Strategy
-
-| Test | Type |
-|------|------|
-| `route_quality` at score 0.9 | Unit |
-| Reducers append snippets | Unit |
-| Full graph smoke | Integration (mock LLM) |
-| Thread resume | Checkpoint test |
-
----
-
-## Part 6: Interview Story
-
-> "We built a LangGraph research system: planner decomposes the question, three parallel retrievers fan-in, writer+critic loop until score ≥ 0.85 or three attempts. State uses reducers for snippets and messages; MemorySaver enables resumable threads. Next we'd swap mock search for hybrid RAG and add HITL before external publish."
-
----
-
-## Part 7: File Layout for the Project
-
-```
-research_team/
-├── state.py          # ResearchState TypedDict
-├── nodes/
-│   ├── planner.py
-│   ├── search.py
-│   ├── writer.py
-│   └── critic.py
-├── graph.py          # compile()
-└── main.py           # CLI
-```
-
-Splitting files mirrors Phase 17 FastAPI import paths.
-
-### Part 8: Environment Variables
-
-```
-LITE_LLM_MODEL=gpt-4o-mini
+# .env
 LITELLM_PROXY_API_KEY=...
 LITELLM_PROXY_API_BASE=...
-LANGCHAIN_TRACING_V2=true   # optional LangSmith
+LITE_LLM_MODEL=gpt-4o-mini
+
+python research_system.py                 # offline: local KB + calculator
+USE_WIKIPEDIA=1 python research_system.py # Wikipedia first, KB fallback
+PAUSE=1 python research_system.py         # pause before EVERY writer run, then auto-resume from checkpoint
 ```
 
-Document in README before capstone demo.
+(PowerShell: `$env:PAUSE="1"; python research_system.py`)
 
-### Part 9: Rubric for Self-Assessment
+**Resume:** `MemorySaver` lives in process memory, so `PAUSE=1` demonstrates resume *within* a run. For crash recovery across processes, swap in `SqliteSaver`/`PostgresSaver` and call `app.stream(None, config)` with the same `thread_id`.
 
-| Criterion | Pass |
-|-----------|------|
-| Parallel search | 3+ branches merge once |
-| Reflection | critic loop with cap |
-| Reducers | snippets append |
-| Checkpoint | thread resume works |
-| Stream | updates visible |
+---
+
+## What Good Output Looks Like
+
+```
+>> planner     -> [('facts', 'How does solar PV generate electricity?'), ('facts', 'How does onshore wind ...'), ('numbers', 'Using typical capacity factors, how much ...')]
+>> specialist  -> #1 facts tools=['wiki_search'] empty=False
+>> specialist  -> #3 numbers tools=['kb_search', 'kb_search', 'calculator', 'calculator'] empty=False
+>> specialist  -> #2 facts tools=['wiki_search'] empty=False
+>> writer      -> revision #0
+>> critic      -> score=9
+
+=== REPORT ===
+Solar PV converts sunlight into electricity with semiconductor cells [1]; wind turbines convert wind's
+kinetic energy via rotor and generator [2]. With typical capacity factors of ~25% (solar) and ~35%
+(onshore wind), 100 MW yields ≈219,000 MWh/year for solar versus ≈306,600 MWh/year for wind [3].
+Conclusion: onshore wind produces about 40% more energy per year from the same capacity.
+```
+
+**Checks that it worked:**
+- Planner produced **2–3** sub-questions with a mix of specialists
+- Each specialist line shows **tools actually called** (a `numbers` finding with no `calculator` is a red flag)
+- Math is correct: 100 × 0.25 × 8760 = **219,000**; 100 × 0.35 × 8760 = **306,600**
+- Order of specialist lines may vary (they run in parallel); writer always comes after all of them
+- `revisions ≤ 2`
+
+---
+
+## Failure Modes
+
+| Failure | Symptom | Defense in this project |
+|---------|---------|------------------------|
+| **Bad plan** (empty / 8 vague questions) | No findings, or huge cost | `[:MAX_SUBQUESTIONS]` cap; empty-plan fallback to the original question |
+| **Overlapping sub-questions** | Duplicate findings | Planner prompt says *non-overlapping*; critic can flag redundancy |
+| **Empty tool result** | `NO_RESULT` | Finding flagged `empty=True`; specialist told to reply `NO EVIDENCE FOUND`; writer writes "Not found:" instead of guessing |
+| **Ungrounded answer** (agent skipped tools) | `tools=[]` | `empty` is also true when no tool ran |
+| **Specialist crash / loop** | Exception, `GraphRecursionError` | `recursion_limit=12` + `try/except` → error finding, run continues |
+| **Critic never satisfied** | Endless rewrites | `MAX_REVISES = 2`, then ship best effort |
+| **Critic gives no issues but low score** | Writer doesn't count a revision | Fallback issue text keeps the counter moving |
+| **Wikipedia down** | Exception in tool | `wiki_search` falls back to local KB |
+
+Try it: ask *"What does geothermal drilling cost in Iceland?"* → the KB has nothing on it → expect `empty=True` and a "Not found" line in the report (with `USE_WIKIPEDIA=1` the facts agent may legitimately find something — that is the real tool working).
 
 ---
 
 ## Common Mistakes
 
-### Mistake 1: Skipping merge node after parallel search
+### Mistake 1: Specialists with every tool
+Wrong tool choices rise with tool count. Two or three tools per specialist.
 
-Writer runs multiple times or with partial evidence — always fan-in once.
+### Mistake 2: Putting raw tool output into shared state
+Findings should be **short answers**, not 3 KB of search results.
 
-### Mistake 2: No attempt cap on critic loop
+### Mistake 3: Writer with free access to its own knowledge
+Then citations are decoration. Force "use ONLY the evidence."
 
-Runaway cost — mirror `attempts >= 3`.
+### Mistake 4: No order key on parallel results
+Reducer order isn't guaranteed. Carry an `id` and sort.
 
-### Mistake 3: Giant draft in messages
-
-Keep `draft` in dedicated state key; messages for UX summaries only.
-
----
-
-## Best Practices
-
-| Practice | Why |
-|----------|-----|
-| Modular nodes | Swap retrievers independently |
-| Stream updates | Demo-friendly |
-| Checkpoint thread | Long research |
-| Structured planner output | Fewer parse bugs |
-| Version graph in git | Reproducible runs |
+### Mistake 5: Treating "no result" as success
+Always detect and surface empties; silent gaps become hallucinations downstream.
 
 ---
 
-## Interview Preparation
+## Interview Talking Points (Project)
 
-### Easy
-**Q: Components of this research graph?**
-
-> Planner, parallel search nodes, merge, writer, critic with conditional revise loop, checkpoint optional.
-
-### Medium
-**Q: Why parallel search nodes?**
-
-> Independent IO/latency; reducers merge snippets before single synthesis LLM call.
-
-### Hard
-**Q: Scale to 10 sources?**
-
-> Dynamic Send API, rate-limit per source, dedupe snippets, rerank merge node, cap tokens into writer.
+- **Architecture in one breath:** *"Planner decomposes into sub-questions, parallel tool-using specialists gather evidence via `Send`, a writer synthesizes strictly from findings, and a critic loop with a revision cap improves it. MemorySaver checkpoints it."*
+- **Why parallel specialists?** Independent sub-questions → latency ≈ slowest one, not the sum.
+- **Why a writer without tools?** It makes grounding enforceable: anything not in `findings` is a critic-detectable violation.
+- **Shared vs private:** specialists' ReAct traces stay private; only distilled findings are shared.
+- **Failure handling:** caps (subquestions, revisions, recursion), empty-result flagging, per-worker try/except.
+- **What you'd add for production:** persistent checkpointer, real search API, tracing (LangSmith), cost budget, tests with fixed `findings`.
+- **Trade-off you can discuss:** more agents = more cost/latency; each added role must fix a measured failure.
 
 ---
 
 ## Summary
 
-| Stage | Output |
-|-------|--------|
-| Plan | subquestions |
-| Retrieve | snippets (parallel) |
-| Write | draft |
-| Critique | score + feedback |
-| Revise loop | quality gate |
+| Piece | Implementation |
+|-------|---------------|
+| Planner | `with_structured_output(ResearchPlan)` + cap + fallback |
+| Specialists | `create_react_agent` with `wiki_search` / `kb_search` / `calculator`, run in parallel via `Send` |
+| Merger/Writer | LLM using only `findings`, sorted by `id` |
+| Critic loop | Structured score, `MAX_REVISES = 2` |
+| Checkpoint | `MemorySaver` + `thread_id`, optional `interrupt_before` |
+| Progress | `app.stream(..., stream_mode="updates")` printing node names |
 
 ---
 
-## Exercises
+## Hands-on: Swap in a New Specialist Tool
 
-1. Add fourth subquestion dynamically if score < 0.5 after first critic pass.
+Add a tool that estimates how many homes the energy could power, and give it to the `numbers` specialist.
 
-2. Persist `objective` across two invokes on same thread with follow-up "go deeper on Postgres".
+```python
+@tool
+def homes_powered(annual_mwh: float) -> str:
+    """Estimate households powered by annual energy in MWh (assumes 10.5 MWh per household per year)."""
+    return f"{round(annual_mwh / 10.5)} households (assuming 10.5 MWh/household/year)"
 
-3. Replace mock search with Chroma collection from Phase 11.
 
-4. Add supervisor node that picks only 2 of 3 searchers based on query topic.
+SPECIALISTS["numbers"] = create_react_agent(llm, [kb_search, calculator, homes_powered], prompt=(
+    "You are the NUMBERS specialist. Get figures with kb_search, compute with calculator, and use "
+    "homes_powered to translate MWh into households. If figures are missing reply: NO EVIDENCE FOUND"))
+```
 
-5. Write README section: architecture diagram + env vars — prep for Phase 17 FastAPI wrap.
+Re-run with: *"...which produces more energy from 100 MW, and how many homes does each power?"* Confirm `homes_powered` appears in a specialist's `tools=[...]` line.
+
+**Then try:** add a brand-new `"economics"` specialist — add it to `SubQuestion.specialist`'s `Literal`, to `SPECIALISTS`, and describe it in the planner prompt. Which three edits were needed? (Answer: schema, registry, planner prompt — the graph itself did not change.)
+
+## Challenge: Supervisor-Style Final Synthesizer
+
+Add a `synthesizer` node **after** the critic approves that behaves like a supervisor (Chapter 16.1):
+
+1. It reads `report` + `findings` and returns structured `Verdict(action: Literal["finish", "research_more"], extra_question: str, specialist: str)`.
+2. If `research_more`, send **one** extra `Send("specialist", ...)` then go back to `writer` (cap with a new `extra_rounds` counter, max 1).
+3. If `finish`, produce the final answer with an "Evidence quality" line (how many findings were `empty`).
+
+Hints: reuse `fan_out`'s `Send` pattern; keep the idx unique (`len(findings)`); add `extra_rounds` to `ResearchState`; watch your caps — the supervisor is the easiest place to create an infinite loop.
 
 ---
 
 ## What's Next
 
-[Chapter 17.1 — FastAPI Integration](../phase-17-production/chapter-74-fastapi-integration.md) exposes this graph as a production HTTP API with streaming and session management.
+Phase 17 takes agents to production. [Chapter 17.1 — FastAPI Integration](../phase-17-production/chapter-74-fastapi-integration.md) wraps graphs like this one in an API.
 
 ---
 
